@@ -1,0 +1,13 @@
+{
+  "name": "n8n-automation-portfolio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-style n8n workflows: AI lead qualifier, AI support agent, competitor price monitor.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-workflows.mjs",
+    "check": "node scripts/build-workflows.mjs --check",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "license": "MIT"
+}

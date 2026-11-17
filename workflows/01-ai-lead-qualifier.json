@@ -1,0 +1,455 @@
+{
+  "id": "9ea2278e837474e7",
+  "name": "AI Lead Qualifier (Webhook → OpenAI → Slack / Sheets / Email)",
+  "active": false,
+  "nodes": [
+    {
+      "id": "1220c4c0-ced9-9ac6-cf60-855402b99332",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -240
+      ],
+      "parameters": {
+        "content": "## AI Lead Qualifier\nReceives website form leads, scores them with an LLM and routes them:\n- **Hot / unclear** → instant Slack alert to sales\n- **Warm / cold** → personalised AI reply email\n- **Spam** → logged only\nEvery lead is logged to Google Sheets.\n\nThe OpenAI call uses plain HTTP so any OpenAI-compatible API (Azure, Groq, local LLM) works.",
+        "width": 400,
+        "height": 300,
+        "color": 4
+      }
+    },
+    {
+      "id": "14d20f5b-083c-8448-df30-1b246baf418a",
+      "name": "Lead Form Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        200
+      ],
+      "webhookId": "631dfc16-2148-37c0-857d-b9c226b6cafa",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "3f104b1e-6a3d-3d9b-08e3-b14b027c5ac8",
+      "name": "Validate & Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -180,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// Code node: \"Validate & Normalize\"\n// Cleans up a raw form submission and flags anything we should reject\n// before spending money on an LLM call.\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/;\nconst clean = (v, max) => String(v ?? '').replace(/\\s+/g, ' ').trim().slice(0, max);\n\nreturn $input.all().map((item) => {\n  // Webhook node puts the POST body under `body`; fall back to the item itself.\n  const body = item.json.body ?? item.json;\n  const lead = {\n    name: clean(body.name, 120),\n    email: clean(body.email, 254).toLowerCase(),\n    company: clean(body.company, 160),\n    message: clean(body.message, 4000),\n    source: clean(body.source || 'website', 60),\n    received_at: new Date().toISOString(),\n  };\n\n  const errors = [];\n  if (!lead.name) errors.push('name is required');\n  if (!EMAIL_RE.test(lead.email)) errors.push('a valid email is required');\n  if (lead.message.length < 10) errors.push('message must be at least 10 characters');\n\n  return { json: { ...lead, valid: errors.length === 0, errors } };\n});\n"
+      }
+    },
+    {
+      "id": "0f756d51-557f-3ecc-12c2-f03495863ebf",
+      "name": "Is Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        40,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "38ee18c1-b3b8-fc35-33b5-34f65c5ed7b1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "58aabd2f-550a-87b0-7246-71ecb42a56e2",
+      "name": "Respond 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        260,
+        360
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"ok\": false, \"errors\": $json.errors } }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "f7ea42e6-3903-e76d-c3f2-bc868987fcfe",
+      "name": "Respond 202",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        260,
+        120
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"ok\": true, \"message\": \"Thanks! We will be in touch shortly.\" } }}",
+        "options": {
+          "responseCode": 202
+        }
+      }
+    },
+    {
+      "id": "5ce3472f-ac69-041c-533c-4c04697518d7",
+      "name": "Score Lead (OpenAI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        120
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "OpenAI account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"gpt-4.1-mini\", temperature: 0.2, response_format: { type: \"json_object\" }, messages: [ { role: \"system\", content: \"You are a B2B sales assistant. Score the inbound lead from 0-100 for purchase intent and fit.\\nReturn ONLY a JSON object with keys:\\n  score (integer 0-100), category (\\\"hot\\\" | \\\"warm\\\" | \\\"cold\\\" | \\\"spam\\\"),\\n  summary (one sentence for the sales team),\\n  reply_draft (a friendly, specific reply email body to the lead, signed \\\"The Team\\\"; empty string for spam).\\nTreat anything that is advertising, SEO offers, or gibberish as spam.\" }, { role: \"user\", content: \"Name: \" + $('Validate & Normalize').item.json.name + \"\\nCompany: \" + $('Validate & Normalize').item.json.company + \"\\nEmail: \" + $('Validate & Normalize').item.json.email + \"\\nMessage: \" + $('Validate & Normalize').item.json.message } ] }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "7e688aa9-0a2d-6bc0-1fef-32393d979654",
+      "name": "Parse AI Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// Code node: \"Parse AI Score\"\n// Merges the model's JSON verdict back onto the original lead and decides\n// where the lead goes next. Any malformed model output is routed to a human\n// instead of being auto-answered.\nconst leads = $('Validate & Normalize').all();\nconst CATEGORIES = ['hot', 'warm', 'cold', 'spam'];\n\nreturn $input.all().map((item, i) => {\n  const lead = { ...(leads[i]?.json ?? {}) };\n  delete lead.valid;\n  delete lead.errors;\n\n  let ai = null;\n  try {\n    const content = item.json.choices?.[0]?.message?.content;\n    const parsed = typeof content === 'string' ? JSON.parse(content) : null;\n    if (parsed && typeof parsed === 'object') ai = parsed;\n  } catch (e) {\n    ai = null;\n  }\n\n  if (!ai) {\n    return {\n      json: {\n        ...lead,\n        score: null,\n        category: 'needs_review',\n        summary: 'AI scoring failed - please review manually.',\n        reply_draft: '',\n        route: 'alert',\n      },\n    };\n  }\n\n  const score = Math.max(0, Math.min(100, Math.round(Number(ai.score) || 0)));\n  const category = CATEGORIES.includes(ai.category)\n    ? ai.category\n    : score >= 70 ? 'hot' : score >= 40 ? 'warm' : 'cold';\n  const replyDraft = String(ai.reply_draft ?? '').trim().slice(0, 3000);\n\n  let route = 'reply';\n  if (category === 'spam') route = 'ignore';\n  else if (category === 'hot' || score >= 70) route = 'alert';\n  else if (!replyDraft) route = 'alert';\n\n  return {\n    json: {\n      ...lead,\n      score,\n      category,\n      summary: String(ai.summary ?? '').trim().slice(0, 500),\n      reply_draft: replyDraft,\n      route,\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "c0aecea9-9627-0f60-f23c-aa7de89ce8f3",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        920,
+        -60
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      },
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Leads"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "6ebe102b-505b-52f0-076f-98e6902c8023",
+      "name": "Needs Sales Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        920,
+        120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "14f2ee30-0354-2b79-2112-757736bba513",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "alert",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "adffe8e0-0136-72ff-b30f-dc7b3d339c83",
+      "name": "Alert Sales on Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1140,
+        40
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack account"
+        }
+      },
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "#sales-leads"
+        },
+        "text": "=:fire: *New {{ $json.category }} lead* ({{ $json.score ?? \"n/a\" }}/100)\n*{{ $json.name }}* · {{ $json.company || \"no company\" }} · {{ $json.email }}\n> {{ $json.summary }}\n_Message:_ {{ $json.message }}",
+        "otherOptions": {}
+      }
+    },
+    {
+      "id": "b02a58a6-faa4-1d39-8e52-8d26b203ab43",
+      "name": "Should Auto-Reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1140,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0e53305-99e6-318a-32ca-ff0ab1ab1d7f",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "reply",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c92aa3dc-38e4-e4e4-b8d2-56a446882209",
+      "name": "Send AI Reply Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1360,
+        200
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "parameters": {
+        "fromEmail": "hello@yourcompany.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "=Re: your enquiry{{ $json.company ? \" from \" + $json.company : \"\" }}",
+        "emailFormat": "text",
+        "text": "={{ $json.reply_draft }}",
+        "options": {
+          "appendAttribution": false
+        }
+      }
+    },
+    {
+      "id": "6b7b052b-cbef-81c7-2e5f-32f3b7c5803c",
+      "name": "Spam - Do Nothing",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        360
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Lead Form Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate & Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Normalize": {
+      "main": [
+        [
+          {
+            "node": "Is Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Valid?": {
+      "main": [
+        [
+          {
+            "node": "Respond 202",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 202": {
+      "main": [
+        [
+          {
+            "node": "Score Lead (OpenAI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Lead (OpenAI)": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Score": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Needs Sales Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Sales Alert?": {
+      "main": [
+        [
+          {
+            "node": "Alert Sales on Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Should Auto-Reply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Auto-Reply?": {
+      "main": [
+        [
+          {
+            "node": "Send AI Reply Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Spam - Do Nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

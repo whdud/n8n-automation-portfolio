@@ -1,0 +1,228 @@
+{
+  "id": "3a14ae7ff195988b",
+  "name": "Competitor Price Monitor (Scrape → Compare → Email Digest)",
+  "active": false,
+  "nodes": [
+    {
+      "id": "d4a292d2-43db-5da7-cb36-529e94c1ffc4",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -480,
+        -320
+      ],
+      "parameters": {
+        "content": "## Competitor Price Monitor\nEvery morning it scrapes competitor product pages, compares prices with yesterday and emails a digest **only when something changed** (or a page broke).\n\n- Handles `$1,299.99`, `1.299,99 €`, `₩12,900`\n- Per-product change threshold\n- Remembers prices in workflow static data — no database needed\n\n_Activate the workflow: static data is only saved on production runs._",
+        "width": 420,
+        "height": 320,
+        "color": 4
+      }
+    },
+    {
+      "id": "1ff9f389-844c-e1fa-2f21-a3a0e00fe0ce",
+      "name": "Every Morning 8am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -420,
+        100
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "1ba772c1-4af2-7a31-6925-ac7141635461",
+      "name": "Product List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// Edit this list: one entry per product page to watch.\n// selector = CSS selector of the price element on that page.\n// threshold_pct = ignore changes smaller than this percentage.\nreturn [\n  { name: 'Competitor A - Wireless Mouse', url: 'https://competitor-a.example.com/products/wireless-mouse', selector: '.price', threshold_pct: 1 },\n  { name: 'Competitor B - Wireless Mouse', url: 'https://competitor-b.example.com/item/123', selector: '[itemprop=\"price\"]', threshold_pct: 1 },\n].map((p) => ({ json: p }));\n"
+      }
+    },
+    {
+      "id": "45e66f78-a58a-8d7b-c1b9-634f158e8273",
+      "name": "Fetch Product Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        20,
+        100
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (compatible; PriceMonitor/1.0)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 20000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "d8decc01-f6d4-6200-43ea-f38f68e63d81",
+      "name": "Extract Price",
+      "type": "n8n-nodes-base.html",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "operation": "extractHtmlContent",
+        "sourceData": "json",
+        "dataPropertyName": "data",
+        "extractionValues": {
+          "values": [
+            {
+              "key": "price",
+              "cssSelector": "={{ $('Product List').item.json.selector }}",
+              "returnValue": "text"
+            }
+          ]
+        },
+        "options": {
+          "trimValues": true,
+          "cleanUpText": true
+        }
+      }
+    },
+    {
+      "id": "888b3241-5aec-b41c-a0f2-fe1056d4cb15",
+      "name": "Detect Price Changes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// Code node: \"Detect Price Changes\"\n// Parses scraped prices, compares them with the last run (kept in workflow\n// static data), and emits ONE digest item only when something changed.\n// Static data persists between production (active) executions only.\nconst store = $getWorkflowStaticData('global');\nstore.prices = store.prices || {};\n\nfunction parsePrice(raw) {\n  let s = String(raw ?? '').replace(/[^\\d.,]/g, '');\n  if (!/\\d/.test(s)) return null;\n  const lastDot = s.lastIndexOf('.');\n  const lastComma = s.lastIndexOf(',');\n  if (lastDot !== -1 && lastComma !== -1) {\n    // Whichever separator comes last is the decimal mark: 1.299,99 / 1,299.99\n    const dec = lastDot > lastComma ? '.' : ',';\n    const thou = dec === '.' ? ',' : '.';\n    s = s.split(thou).join('').replace(dec, '.');\n  } else if (lastComma !== -1) {\n    // Only commas: \"12,900\" is thousands, \"12,90\" is decimal.\n    const parts = s.split(',');\n    const tail = parts[parts.length - 1];\n    s = parts.length > 2 || tail.length === 3 ? parts.join('') : parts.join('.');\n  } else if (lastDot !== -1) {\n    const parts = s.split('.');\n    const tail = parts[parts.length - 1];\n    s = parts.length > 2 || (tail.length === 3 && parts[0] !== '0') ? parts.join('') : s;\n  }\n  const n = Number(s);\n  return Number.isFinite(n) ? n : null;\n}\n\nconst products = $('Product List').all();\nconst changes = [];\nconst errors = [];\n\n$input.all().forEach((item, i) => {\n  const p = products[i]?.json ?? {};\n  const raw = Array.isArray(item.json.price) ? item.json.price[0] : item.json.price;\n  const price = parsePrice(raw);\n  if (price === null) {\n    errors.push({ name: p.name, url: p.url, raw: String(raw ?? '') });\n    return;\n  }\n  const prev = store.prices[p.url];\n  store.prices[p.url] = price;\n  if (prev === undefined || prev === price) return; // first sighting or unchanged\n\n  const pct = prev === 0 ? 100 : ((price - prev) / prev) * 100;\n  if (Math.abs(pct) < Number(p.threshold_pct ?? 0)) return;\n  changes.push({ name: p.name, url: p.url, prev, price, pct: Math.round(pct * 10) / 10 });\n});\n\nif (changes.length === 0 && errors.length === 0) return [];\n\nconst esc = (v) => String(v).replace(/[&<>\"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[c]));\nconst rows = changes\n  .map((c) => `<tr><td><a href=\"${esc(c.url)}\">${esc(c.name)}</a></td><td>${c.prev}</td><td>${c.price}</td><td>${c.pct > 0 ? '▲' : '▼'} ${Math.abs(c.pct)}%</td></tr>`)\n  .join('');\nconst errorList = errors.map((e) => `<li>${esc(e.name)}: could not read a price from \"${esc(e.raw)}\"</li>`).join('');\n\nconst html = [\n  changes.length ? `<h2>Price changes (${changes.length})</h2><table border=\"1\" cellpadding=\"6\"><tr><th>Product</th><th>Before</th><th>Now</th><th>Change</th></tr>${rows}</table>` : '',\n  errors.length ? `<h3>Scrape problems (${errors.length})</h3><ul>${errorList}</ul>` : '',\n].join('');\n\nreturn [{\n  json: {\n    subject: changes.length\n      ? `[Price Monitor] ${changes.length} price change(s) detected`\n      : `[Price Monitor] ${errors.length} product(s) could not be checked`,\n    html,\n    changes,\n    errors,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "4c0ae571-a417-93eb-a1fc-6ee52de234ab",
+      "name": "Email Digest",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        680,
+        100
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "parameters": {
+        "fromEmail": "monitor@yourcompany.com",
+        "toEmail": "pricing-team@yourcompany.com",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every Morning 8am": {
+      "main": [
+        [
+          {
+            "node": "Product List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Product List": {
+      "main": [
+        [
+          {
+            "node": "Fetch Product Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Product Page": {
+      "main": [
+        [
+          {
+            "node": "Extract Price",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Price": {
+      "main": [
+        [
+          {
+            "node": "Detect Price Changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Price Changes": {
+      "main": [
+        [
+          {
+            "node": "Email Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
